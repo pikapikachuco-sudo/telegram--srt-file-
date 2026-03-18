@@ -1,8 +1,3 @@
-"""
-বাংলা সাবটাইটেল অনুবাদ বট
-Multi-Key | Self-Ping | Channel Guard
-"""
-
 import os
 import re
 import io
