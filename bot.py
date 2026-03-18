@@ -1,119 +1,136 @@
 """
-╔══════════════════════════════════════════════╗
-║     🎬  বাংলা সাবটাইটেল অনুবাদ বট           ║
-║     Multi-Key · Self-Ping · Channel Guard     ║
-╚══════════════════════════════════════════════╝
+বাংলা সাবটাইটেল অনুবাদ বট
+Multi-Key | Self-Ping | Channel Guard
 """
 
-import os, re, io, logging, threading, asyncio, time, requests
+import os
+import re
+import io
+import logging
+import threading
+import asyncio
+import time
+
+import requests
 from flask import Flask
-from groq import Groq, RateLimitError
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
 )
 from telegram.error import TelegramError
 
-# ──────────────────────────────────────────────
+# groq lazy import — RateLimitError handled by name check
+import groq as groq_module
+
+# ──────────────────────────────────────────────────────────
 #  LOGGING
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s │ %(levelname)-8s │ %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-#  ENV CONFIG
-# ──────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-RENDER_URL      = os.environ.get("RENDER_URL", "")          # e.g. https://subtitle-bot.onrender.com
-CHANNEL_ID      = os.environ.get("CHANNEL_ID", "")          # e.g. @mychannel  OR  -1001234567890
-CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/yourchannel")
+# ──────────────────────────────────────────────────────────
+#  CONFIG FROM ENVIRONMENT
+# ──────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+RENDER_URL     = os.environ.get("RENDER_URL", "")
+CHANNEL_ID     = os.environ.get("CHANNEL_ID", "")
+CHANNEL_LINK   = os.environ.get("CHANNEL_LINK", "https://t.me/yourchannel")
 
-# Multiple Groq keys — comma-separated in env
-_raw_keys = os.environ.get("GROQ_API_KEYS", os.environ.get("GROQ_API_KEY", ""))
-GROQ_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+_raw = os.environ.get("GROQ_API_KEYS", os.environ.get("GROQ_API_KEY", ""))
+GROQ_KEYS = [k.strip() for k in _raw.split(",") if k.strip()]
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN environment variable missing!")
 if not GROQ_KEYS:
-    raise ValueError("কোনো GROQ_API_KEYS পাওয়া যায়নি!")
+    raise RuntimeError("GROQ_API_KEYS environment variable missing!")
 
-BATCH_SIZE = 10   # lines per API call
+BATCH_SIZE = 10
 
-# ──────────────────────────────────────────────
-#  MULTI-KEY MANAGER  (round-robin + fallback)
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+#  MULTI-KEY MANAGER
+# ──────────────────────────────────────────────────────────
 class KeyManager:
-    def __init__(self, keys: list[str]):
+    def __init__(self, keys):
         self.keys    = keys
-        self.idx     = 0
-        self.lock    = threading.Lock()
-        self.clients = [Groq(api_key=k) for k in keys]
-        log.info(f"🔑 {len(keys)}টি API key লোড হয়েছে")
+        self._idx    = 0
+        self._lock   = threading.Lock()
+        self.clients = [groq_module.Groq(api_key=k) for k in keys]
+        log.info(f"KeyManager: {len(keys)} টি API key লোড হয়েছে")
 
-    def current(self) -> Groq:
-        with self.lock:
-            return self.clients[self.idx]
+    @property
+    def idx(self):
+        return self._idx
 
-    def rotate(self) -> int:
-        with self.lock:
-            self.idx = (self.idx + 1) % len(self.keys)
-            log.info(f"🔄 API key #{self.idx + 1} তে স্যুইচ করা হয়েছে")
-            return self.idx
+    def current(self):
+        with self._lock:
+            return self.clients[self._idx]
 
-    def total(self) -> int:
+    def current_num(self):
+        with self._lock:
+            return self._idx + 1
+
+    def total(self):
         return len(self.keys)
 
-    def current_num(self) -> int:
-        return self.idx + 1
+    def rotate(self):
+        with self._lock:
+            self._idx = (self._idx + 1) % len(self.keys)
+            log.info(f"API key #{self._idx + 1} তে স্যুইচ")
+            return self._idx
+
 
 km = KeyManager(GROQ_KEYS)
 
-# ──────────────────────────────────────────────
-#  FLASK KEEP-ALIVE
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+#  FLASK (keep-alive + self-ping)
+# ──────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def health():
-    return "🟢 বট চলছে!", 200
+    return "OK", 200
 
 @flask_app.route("/ping")
-def ping():
-    return "🏓 pong", 200
+def ping_route():
+    return "pong", 200
 
 def _run_flask():
     port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-def _self_ping_loop():
-    """বট নিজেই নিজেকে প্রতি ১০ মিনিটে ping করে — Render free tier ঘুমায় না"""
+def _self_ping():
     if not RENDER_URL:
-        log.warning("RENDER_URL সেট নেই — self-ping বন্ধ।")
+        log.warning("RENDER_URL নেই — self-ping বন্ধ")
         return
-    time.sleep(30)   # startup delay
+    time.sleep(60)
     while True:
         try:
             r = requests.get(f"{RENDER_URL}/ping", timeout=10)
-            log.info(f"🏓 Self-ping: {r.status_code}")
+            log.info(f"Self-ping: {r.status_code}")
         except Exception as e:
             log.warning(f"Self-ping ব্যর্থ: {e}")
-        time.sleep(600)   # 10 minutes
+        time.sleep(600)
 
-# ──────────────────────────────────────────────
-#  USER STATES
-# ──────────────────────────────────────────────
-user_states: dict[int, dict] = {}
+# ──────────────────────────────────────────────────────────
+#  USER STATE
+# ──────────────────────────────────────────────────────────
+user_states: dict = {}
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 #  SUBTITLE PARSER
-# ──────────────────────────────────────────────
-def parse_srt(content: str) -> list[dict]:
+# ──────────────────────────────────────────────────────────
+def parse_srt(text):
     blocks, seen = [], set()
-    for raw in re.split(r"\n\s*\n", content.strip()):
-        lines = raw.strip().splitlines()
+    for chunk in re.split(r"\n\s*\n", text.strip()):
+        lines = chunk.strip().splitlines()
         if len(lines) >= 3 and "-->" in lines[1]:
             key = lines[1].strip()
             if key not in seen:
@@ -122,169 +139,147 @@ def parse_srt(content: str) -> list[dict]:
                     "index": lines[0].strip(),
                     "time":  lines[1].strip(),
                     "text":  "\n".join(lines[2:]).strip(),
-                    "translated": "",
+                    "out":   "",
                 })
     return blocks
 
-def parse_vtt(content: str) -> list[dict]:
-    blocks, lines = [], content.splitlines()
+def parse_vtt(text):
+    blocks, lines = [], text.splitlines()
     i = idx = 0
     while i < len(lines) and "-->" not in lines[i]:
         i += 1
     while i < len(lines):
         if "-->" in lines[i]:
-            time_line, i = lines[i].strip(), i + 1
-            texts = []
+            tl = lines[i].strip()
+            i += 1
+            parts = []
             while i < len(lines) and lines[i].strip() and "-->" not in lines[i]:
-                texts.append(lines[i].strip()); i += 1
-            if texts:
+                parts.append(lines[i].strip())
+                i += 1
+            if parts:
                 idx += 1
-                blocks.append({"index": str(idx), "time": time_line,
-                                "text": "\n".join(texts), "translated": ""})
+                blocks.append({"index": str(idx), "time": tl,
+                               "text": "\n".join(parts), "out": ""})
         else:
             i += 1
     return blocks
 
-def build_srt(blocks: list[dict]) -> str:
+def build_srt(blocks):
     return "\n\n".join(
-        f"{b['index']}\n{b['time']}\n{b['translated'] or b['text']}"
+        f"{b['index']}\n{b['time']}\n{b['out'] or b['text']}"
         for b in blocks
     ) + "\n"
 
-def build_vtt(blocks: list[dict]) -> str:
+def build_vtt(blocks):
     parts = ["WEBVTT", ""]
     for b in blocks:
-        parts.append(f"{b['time']}\n{b['translated'] or b['text']}")
+        parts.append(f"{b['time']}\n{b['out'] or b['text']}")
     return "\n\n".join(parts)
 
-# ──────────────────────────────────────────────
-#  PIE-CHART PROGRESS DISPLAY
-# ──────────────────────────────────────────────
-def pie_chart(pct: int) -> str:
-    """Unicode পাই চার্ট — ৮টি ধাপে"""
-    # Braille-style arc segments
-    stages = [
-        "○",   # 0%
-        "◔",   # ~12%
-        "◔",   # ~25%
-        "◑",   # ~37%
-        "◑",   # ~50%
-        "◕",   # ~62%
-        "◕",   # ~75%
-        "●",   # ~87%
-        "●",   # 100%
-    ]
-    idx = min(int(pct / 100 * 8), 8)
-    return stages[idx]
-
-def progress_block(done: int, total: int, key_num: int, key_total: int) -> str:
+# ──────────────────────────────────────────────────────────
+#  PROGRESS DISPLAY
+# ──────────────────────────────────────────────────────────
+def make_progress(done, total, key_num, key_total):
     pct    = int(done / total * 100) if total else 0
-    filled = pct // 4          # 25 segments total
-    empty  = 25 - filled
-    bar    = "▓" * filled + "░" * empty
-    pie    = pie_chart(pct)
-    remain = total - done
+    filled = pct // 5   # 20 blocks
+    bar    = "█" * filled + "░" * (20 - filled)
 
-    # "Pie chart" text art
-    top    = "·" * 5
-    mid    = f"  {pie}  {pct}%"
+    # Pie symbol
+    pie_symbols = ["○", "◔", "◔", "◑", "◑", "◕", "◕", "●", "●"]
+    pie = pie_symbols[min(int(pct / 100 * 8), 8)]
 
-    lines = [
-        f"",
-        f"     ╭───────────────╮",
-        f"     │  {pie}   {pct:>3}%  অনুবাদ  │",
-        f"     ╰───────────────╯",
-        f"",
-        f"  ▓ [{bar}] ░",
-        f"",
-        f"  ✅ সম্পন্ন  : {done:>4} টি সংলাপ",
-        f"  ⏳ বাকি    : {remain:>4} টি সংলাপ",
-        f"  📊 মোট     : {total:>4} টি সংলাপ",
-        f"  🔑 API Key : #{key_num} / {key_total}",
-    ]
-    return "\n".join(lines)
-
-# ──────────────────────────────────────────────
-#  TRANSLATION  (sync)
-# ──────────────────────────────────────────────
-_SYSTEM = """তুমি একজন দক্ষ চলচ্চিত্র সাবটাইটেল অনুবাদক।
-
-তোমার কাজ:
-• প্রতিটি সংলাপের **ভাব ও অনুভূতি** বজায় রেখে বাংলায় অনুবাদ করো
-• আক্ষরিক অনুবাদ একদম নয় — বাংলা ভাষায় স্বাভাবিকভাবে যেভাবে বলা হয় সেভাবে লেখো
-• চরিত্রের আবেগ, রসিকতা, রাগ, ভালোবাসা — সবকিছু ধরে রাখো
-• HTML ট্যাগ যেমন <i>, <b>, <font> হুবহু রেখে দাও
-• বাংলা লেখায় সঠিক বানান ও যুক্তবর্ণ ব্যবহার করো
-• সংখ্যা বাংলায় লেখার দরকার নেই (১, ২ না লিখে 1, 2 রেখে দাও)
-
-উত্তরের ফরম্যাট: শুধু "ক্রমনম্বর. অনুবাদ" — অন্য কোনো কথা লিখবে না"""
-
-def _do_translate(client: Groq, texts: list[str]) -> list[str]:
-    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user",   "content": f"নিচের সংলাপগুলো বাংলায় অনুবাদ করো:\n\n{numbered}"},
-        ],
-        temperature=0.2,
-        max_tokens=3000,
+    return (
+        f"\n"
+        f"  ╭──────────────────────────╮\n"
+        f"  │   {pie}  অনুবাদ হচ্ছে...  {pct:>3}%  │\n"
+        f"  ╰──────────────────────────╯\n"
+        f"\n"
+        f"  [{bar}]\n"
+        f"\n"
+        f"  ✅ সম্পন্ন  :  {done} টি\n"
+        f"  ⏳ বাকি    :  {total - done} টি\n"
+        f"  📊 মোট     :  {total} টি\n"
+        f"  🔑 API Key :  #{key_num} / {key_total}\n"
     )
-    raw    = resp.choices[0].message.content.strip()
-    result = {}
-    for line in raw.splitlines():
-        m = re.match(r"^(\d+)\.\s*(.*)", line.strip())
-        if m:
-            i = int(m.group(1)) - 1
-            if 0 <= i < len(texts):
-                result[i] = m.group(2).strip()
-    return [result.get(i, texts[i]) for i in range(len(texts))]
 
-def translate_batch(texts: list[str]) -> list[str]:
-    """Rotate keys on rate-limit error"""
+# ──────────────────────────────────────────────────────────
+#  TRANSLATION
+# ──────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """তুমি একজন দক্ষ চলচ্চিত্র সাবটাইটেল অনুবাদক।
+
+নিয়ম:
+১. ভাব ও অনুভূতি বজায় রেখে বাংলায় অনুবাদ করো — আক্ষরিক অনুবাদ একদম নয়
+২. চরিত্রের আবেগ, রসিকতা, রাগ, ভালোবাসা সব ধরে রাখো
+৩. HTML ট্যাগ যেমন <i> <b> হুবহু রেখে দাও
+৪. বাংলা বানান ও যুক্তবর্ণ সঠিকভাবে লেখো
+৫. সংখ্যা ইংরেজিতেই রাখো
+
+উত্তর শুধুমাত্র এই ফরম্যাটে দাও:
+1. অনুবাদ
+2. অনুবাদ
+(কোনো বাড়তি কথা লিখবে না)"""
+
+
+def _translate_sync(texts):
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
     for attempt in range(km.total()):
         try:
-            return _do_translate(km.current(), texts)
-        except RateLimitError:
-            log.warning(f"⚠️  Key #{km.current_num()} rate limit — পরের key তে যাচ্ছি")
-            km.rotate()
+            resp = km.current().chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": f"অনুবাদ করো:\n\n{numbered}"},
+                ],
+                temperature=0.2,
+                max_tokens=3000,
+            )
+            raw    = resp.choices[0].message.content.strip()
+            result = {}
+            for line in raw.splitlines():
+                m = re.match(r"^(\d+)\.\s*(.*)", line.strip())
+                if m:
+                    i = int(m.group(1)) - 1
+                    if 0 <= i < len(texts):
+                        result[i] = m.group(2).strip()
+            return [result.get(i, texts[i]) for i in range(len(texts))]
+
         except Exception as e:
-            log.error(f"Translation error: {e}")
-            if attempt < km.total() - 1:
+            err_name = type(e).__name__
+            if "RateLimit" in err_name or "rate_limit" in str(e).lower():
+                log.warning(f"Key #{km.current_num()} rate limit — পরের key তে যাচ্ছি")
+                km.rotate()
+            elif attempt < km.total() - 1:
+                log.warning(f"Translation error ({err_name}), key rotate করছি")
                 km.rotate()
             else:
-                raise
-    raise RuntimeError("সমস্ত API Key exhausted হয়েছে।")
+                raise RuntimeError(f"সব API key ব্যর্থ: {e}")
+    return texts
 
-async def translate_async(texts: list[str]) -> list[str]:
-    return await asyncio.to_thread(translate_batch, texts)
 
-# ──────────────────────────────────────────────
-#  CHANNEL MEMBERSHIP CHECK
-# ──────────────────────────────────────────────
-async def is_member(bot, user_id: int) -> bool:
+async def translate_async(texts):
+    return await asyncio.to_thread(_translate_sync, texts)
+
+# ──────────────────────────────────────────────────────────
+#  CHANNEL CHECK
+# ──────────────────────────────────────────────────────────
+async def is_member(bot, user_id):
     if not CHANNEL_ID:
-        return True          # Channel check বন্ধ থাকলে সবাইকে allow
+        return True
     try:
         m = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        # status হলো string: "member", "administrator", "creator", "left", "kicked"
         return m.status in ("member", "administrator", "creator")
     except TelegramError as e:
         log.warning(f"Channel check error: {e}")
-        return True          # Error হলে block না করে allow করো
+        return True
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 #  KEYBOARDS
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 def kb_main():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📖 কীভাবে ব্যবহার করবেন", callback_data="help"),
-        ],
-        [
-            InlineKeyboardButton("ℹ️ বট সম্পর্কে",  callback_data="about"),
-            InlineKeyboardButton("🔑 API স্ট্যাটাস", callback_data="status"),
-        ],
+        [InlineKeyboardButton("📖 ব্যবহার পদ্ধতি",  callback_data="help"),
+         InlineKeyboardButton("ℹ️ বট সম্পর্কে",     callback_data="about")],
+        [InlineKeyboardButton("🔑 API Key স্ট্যাটাস", callback_data="status")],
     ])
 
 def kb_join():
@@ -305,121 +300,99 @@ def kb_done():
 
 def kb_back():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️  মূল মেনুতে ফিরুন", callback_data="home")],
+        [InlineKeyboardButton("⬅️ মূল মেনু", callback_data="home")],
     ])
 
-# ──────────────────────────────────────────────
-#  TEXT TEMPLATES
-# ──────────────────────────────────────────────
-def welcome_text(name: str) -> str:
+# ──────────────────────────────────────────────────────────
+#  WELCOME TEXT
+# ──────────────────────────────────────────────────────────
+def welcome(name):
     return (
         f"🎬 *স্বাগতম, {name}!*\n\n"
-        "আমি আপনার সাবটাইটেল ফাইল স্বাভাবিক বাংলায় অনুবাদ করে দিই —\n"
-        "আক্ষরিক নয়, একদম ভাব বুঝে ভাবানুবাদ!\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📁  *সমর্থিত ফরম্যাট:*  `.srt`  ও  `.vtt`\n"
-        "⏱  *টাইমকোড:*  অপরিবর্তিত থাকবে\n"
-        "🔑  *API:*  একাধিক key — স্বয়ংক্রিয় rotation\n"
-        "📊  *লাইভ প্রগতি:*  পাই চার্টসহ\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "আমি আপনার সাবটাইটেল ফাইল স্বাভাবিক বাংলায় অনুবাদ করে দিই।\n"
+        "আক্ষরিক নয় — ভাব বুঝে ভাবানুবাদ!\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📁 *ফরম্যাট :*  `.srt`  এবং  `.vtt`\n"
+        "⏱ *টাইমকোড :*  সম্পূর্ণ অপরিবর্তিত\n"
+        "🔑 *API Key :*  Multi-key rotation\n"
+        "📊 *প্রগতি  :*  লাইভ পাই চার্ট\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "একটি সাবটাইটেল ফাইল পাঠিয়ে শুরু করুন 👇"
     )
 
-JOIN_REQUIRED = (
-    "🔒 *চ্যানেল সদস্যতা প্রয়োজন*\n\n"
-    "এই বট ব্যবহার করতে হলে আমাদের চ্যানেলে Join করতে হবে।\n\n"
-    "নিচের বাটনে ক্লিক করে Join করুন, তারপর ✅ বাটনে চাপুন।"
-)
-
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 #  HANDLERS
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    name = user.first_name or "বন্ধু"
-
     if not await is_member(ctx.bot, user.id):
         await update.message.reply_text(
-            JOIN_REQUIRED, parse_mode="Markdown", reply_markup=kb_join()
+            "🔒 *চ্যানেলে Join করুন*\n\nএই বট ব্যবহার করতে আমাদের চ্যানেলে Join করতে হবে।",
+            parse_mode="Markdown", reply_markup=kb_join()
         )
         return
-
     await update.message.reply_text(
-        welcome_text(name), parse_mode="Markdown", reply_markup=kb_main()
+        welcome(user.first_name or "বন্ধু"),
+        parse_mode="Markdown", reply_markup=kb_main()
     )
 
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
+    uid  = q.from_user.id
     data = q.data
-    user = q.from_user
     await q.answer()
 
-    # ── check_join ──
-    if data == "check_join":
-        if await is_member(ctx.bot, user.id):
-            await q.edit_message_text(
-                welcome_text(user.first_name or "বন্ধু"),
-                parse_mode="Markdown", reply_markup=kb_main()
-            )
-        else:
-            await q.answer("❌ আপনি এখনো Join করেননি!", show_alert=True)
-        return
-
-    # ── home ──
     if data == "home":
         await q.edit_message_text(
-            welcome_text(user.first_name or "বন্ধু"),
+            welcome(q.from_user.first_name or "বন্ধু"),
             parse_mode="Markdown", reply_markup=kb_main()
         )
 
-    # ── help ──
+    elif data == "check_join":
+        if await is_member(ctx.bot, uid):
+            await q.edit_message_text(
+                welcome(q.from_user.first_name or "বন্ধু"),
+                parse_mode="Markdown", reply_markup=kb_main()
+            )
+        else:
+            await q.answer("❌ এখনো Join করেননি!", show_alert=True)
+
     elif data == "help":
-        txt = (
+        await q.edit_message_text(
             "📖 *ব্যবহার পদ্ধতি*\n\n"
             "১️⃣  `.srt` বা `.vtt` ফাইল পাঠান\n"
             "২️⃣  বট স্বয়ংক্রিয়ভাবে অনুবাদ শুরু করবে\n"
             "৩️⃣  লাইভ পাই চার্টে প্রগতি দেখুন\n"
-            "৪️⃣  শেষে বাংলা সাবটাইটেল ফাইল পাবেন\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 *টিপস:*\n"
-            "• ফাইল UTF-8 এনকোডেড হলে সেরা ফলাফল\n"
-            "• একটি অনুবাদ চলাকালে বাতিল করা যাবে\n"
-            "• বড় ফাইলে একটু বেশি সময় লাগবে\n"
-            "• একাধিক API key থাকায় limit-এ আটকাবে না"
+            "৪️⃣  শেষে বাংলা ফাইল পাবেন\n\n"
+            "💡 *টিপস:* UTF-8 ফাইল সবচেয়ে ভালো কাজ করে।",
+            parse_mode="Markdown", reply_markup=kb_back()
         )
-        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_back())
 
-    # ── about ──
     elif data == "about":
-        txt = (
+        await q.edit_message_text(
             "ℹ️ *বট সম্পর্কে*\n\n"
-            "🤖 *AI মডেল:*  Llama 3.3 70B (Groq)\n"
-            "🌐 *অনুবাদ:*  যেকোনো ভাষা → বাংলা\n"
-            "🎯 *পদ্ধতি:*  ভাবানুবাদ — আক্ষরিক নয়\n"
-            "⚡ *স্পিড:*   অত্যন্ত দ্রুত\n"
-            "♻️ *Key:*    Multi-key rotation\n"
-            "🏓 *Uptime:*  Self-ping (Render free)\n\n"
-            "Made with ❤️ for Bangla speakers"
+            "🤖 *মডেল :* Llama 3.3 70B (Groq)\n"
+            "🎯 *পদ্ধতি :* ভাবানুবাদ\n"
+            "♻️ *Key :* Multi-key rotation\n"
+            "🏓 *Uptime :* Self-ping\n\n"
+            "Made with ❤️ for Bangla speakers",
+            parse_mode="Markdown", reply_markup=kb_back()
         )
-        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_back())
 
-    # ── status ──
     elif data == "status":
-        txt = (
+        rows = "\n".join(
+            f"  {'🟢' if i == km.idx else '⚪'} Key #{i+1}"
+            for i in range(km.total())
+        )
+        await q.edit_message_text(
             f"🔑 *API Key স্ট্যাটাস*\n\n"
             f"মোট key: `{km.total()}` টি\n"
-            f"বর্তমান সক্রিয়: `Key #{km.current_num()}`\n\n"
-            + "\n".join(
-                f"  {'🟢' if i == km.idx else '⚪'} Key #{i+1}"
-                for i in range(km.total())
-            )
+            f"সক্রিয়: `Key #{km.current_num()}`\n\n{rows}",
+            parse_mode="Markdown", reply_markup=kb_back()
         )
-        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb_back())
 
-    # ── cancel ──
     elif data == "cancel":
-        uid = q.from_user.id
         if uid in user_states:
             user_states[uid]["cancelled"] = True
         await q.edit_message_text(
@@ -431,20 +404,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    # ── Channel guard ──
     if not await is_member(ctx.bot, user.id):
         await update.message.reply_text(
-            JOIN_REQUIRED, parse_mode="Markdown", reply_markup=kb_join()
+            "🔒 চ্যানেলে Join করুন।",
+            parse_mode="Markdown", reply_markup=kb_join()
         )
         return
 
-    doc      = update.message.document
-    filename = doc.file_name or "subtitle"
+    doc  = update.message.document
+    fname = doc.file_name or "subtitle"
 
-    if not (filename.lower().endswith(".srt") or filename.lower().endswith(".vtt")):
+    if not (fname.lower().endswith(".srt") or fname.lower().endswith(".vtt")):
         await update.message.reply_text(
-            "⚠️ *শুধু `.srt` ও `.vtt` ফাইল সমর্থিত।*\n"
-            "অন্য ফরম্যাট হলে আগে কনভার্ট করুন।",
+            "⚠️ শুধু `.srt` ও `.vtt` ফাইল সমর্থিত।",
             parse_mode="Markdown", reply_markup=kb_main()
         )
         return
@@ -452,7 +424,6 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = user.id
     user_states[uid] = {"cancelled": False}
 
-    # ── Status message ──
     msg = await update.message.reply_text(
         "⬇️ *ফাইল ডাউনলোড হচ্ছে...*",
         parse_mode="Markdown", reply_markup=kb_cancel()
@@ -462,31 +433,31 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tg_file    = await ctx.bot.get_file(doc.file_id)
         file_bytes = await tg_file.download_as_bytearray()
 
-        # Try UTF-8, fallback to latin-1
         try:
             content = file_bytes.decode("utf-8")
         except UnicodeDecodeError:
             content = file_bytes.decode("latin-1")
 
-        ftype  = "vtt" if filename.lower().endswith(".vtt") else "srt"
+        ftype  = "vtt" if fname.lower().endswith(".vtt") else "srt"
         blocks = parse_vtt(content) if ftype == "vtt" else parse_srt(content)
 
         if not blocks:
             await msg.edit_text(
-                "❌ *ফাইলটি পড়া সম্ভব হয়নি।*\n\nসঠিক ফরম্যাটে আছে কিনা দেখুন।",
-                parse_mode="Markdown", reply_markup=kb_main()
+                "❌ ফাইলটি পড়া যায়নি। সঠিক ফরম্যাটে আছে কিনা দেখুন।",
+                reply_markup=kb_main()
             )
             return
 
         total = len(blocks)
+
         await msg.edit_text(
-            f"🎬 *অনুবাদ প্রস্তুতি হচ্ছে...*\n"
-            f"{progress_block(0, total, km.current_num(), km.total())}",
+            f"🔄 *অনুবাদ শুরু হচ্ছে...*\n"
+            f"{make_progress(0, total, km.current_num(), km.total())}",
             parse_mode="Markdown", reply_markup=kb_cancel()
         )
 
-        # ── Batch translate ──
         last_edit = time.time()
+
         for i in range(0, total, BATCH_SIZE):
             if user_states.get(uid, {}).get("cancelled"):
                 return
@@ -496,41 +467,38 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result = await translate_async(texts)
 
             for j, t in enumerate(result):
-                blocks[i + j]["translated"] = t
+                blocks[i + j]["out"] = t
 
             done = min(i + BATCH_SIZE, total)
+            now  = time.time()
 
-            # Throttle edits (max once every 2s to avoid Telegram flood)
-            now = time.time()
-            if now - last_edit >= 2.0 or done == total:
+            if now - last_edit >= 2.5 or done == total:
                 try:
                     await msg.edit_text(
                         f"🔄 *অনুবাদ চলছে...*\n"
-                        f"{progress_block(done, total, km.current_num(), km.total())}",
+                        f"{make_progress(done, total, km.current_num(), km.total())}",
                         parse_mode="Markdown", reply_markup=kb_cancel()
                     )
                     last_edit = now
                 except Exception:
                     pass
 
-        # ── Build output file ──
+        # Build output
         if ftype == "srt":
-            out = build_srt(blocks)
-            out_name = re.sub(r"\.srt$", "_বাংলা.srt", filename, flags=re.IGNORECASE)
+            out_content = build_srt(blocks)
+            out_name    = re.sub(r"\.srt$", "_বাংলা.srt", fname, flags=re.IGNORECASE)
         else:
-            out = build_vtt(blocks)
-            out_name = re.sub(r"\.vtt$", "_বাংলা.vtt", filename, flags=re.IGNORECASE)
+            out_content = build_vtt(blocks)
+            out_name    = re.sub(r"\.vtt$", "_বাংলা.vtt", fname, flags=re.IGNORECASE)
 
-        # ── Final status ──
         await msg.edit_text(
             f"✅ *অনুবাদ সম্পন্ন!*\n"
-            f"{progress_block(total, total, km.current_num(), km.total())}\n\n"
-            f"📥 ফাইল পাঠানো হচ্ছে...",
+            f"{make_progress(total, total, km.current_num(), km.total())}",
             parse_mode="Markdown", reply_markup=kb_done()
         )
 
         await update.message.reply_document(
-            document=io.BytesIO(out.encode("utf-8")),
+            document=io.BytesIO(out_content.encode("utf-8")),
             filename=out_name,
             caption=(
                 f"🎉 *{out_name}*\n\n"
@@ -541,18 +509,18 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         await msg.edit_text(
-            f"🎊 *সব ঠিকঠাক সম্পন্ন!*\n\n"
-            f"📁 ফাইল: `{out_name}`\n"
-            f"📊 মোট সংলাপ: {total} টি\n\n"
+            f"🎊 *সম্পন্ন হয়েছে!*\n\n"
+            f"📁 `{out_name}`\n"
+            f"📊 মোট: {total} টি সংলাপ\n\n"
             f"আরেকটি ফাইল পাঠাতে পারেন।",
             parse_mode="Markdown", reply_markup=kb_done()
         )
 
     except Exception as e:
-        log.error("Document processing error", exc_info=True)
+        log.error("Error in on_document", exc_info=True)
         try:
             await msg.edit_text(
-                f"❌ *সমস্যা হয়েছে:*\n`{str(e)[:250]}`\n\nআবার চেষ্টা করুন।",
+                f"❌ *সমস্যা হয়েছে:*\n`{str(e)[:200]}`\n\nআবার চেষ্টা করুন।",
                 parse_mode="Markdown", reply_markup=kb_main()
             )
         except Exception:
@@ -562,27 +530,26 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Non-command, non-document text — just show menu"""
     if not await is_member(ctx.bot, update.effective_user.id):
         await update.message.reply_text(
-            JOIN_REQUIRED, parse_mode="Markdown", reply_markup=kb_join()
+            "🔒 চ্যানেলে Join করুন।",
+            reply_markup=kb_join()
         )
         return
     await update.message.reply_text(
-        "📁 একটি `.srt` বা `.vtt` সাবটাইটেল ফাইল পাঠান।",
+        "📁 একটি `.srt` বা `.vtt` ফাইল পাঠান।",
         parse_mode="Markdown", reply_markup=kb_main()
     )
 
-# ──────────────────────────────────────────────
-#  MAIN
-# ──────────────────────────────────────────────
-def main():
-    # Flask health server
-    threading.Thread(target=_run_flask,      daemon=True).start()
-    # Self-ping loop
-    threading.Thread(target=_self_ping_loop, daemon=True).start()
 
-    log.info(f"🤖 বট শুরু হচ্ছে | {km.total()} API key | Channel: {CHANNEL_ID or 'বন্ধ'}")
+# ──────────────────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────────────────
+def main():
+    threading.Thread(target=_run_flask,  daemon=True).start()
+    threading.Thread(target=_self_ping,  daemon=True).start()
+
+    log.info(f"বট শুরু হচ্ছে | {km.total()} API key | Channel: {CHANNEL_ID or 'বন্ধ'}")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -591,6 +558,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
 
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
