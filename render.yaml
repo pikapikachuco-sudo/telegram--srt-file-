@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: subtitle-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GROQ_API_KEYS
+        sync: false        # comma-separated: key1,key2,key3
+      - key: RENDER_URL
+        sync: false        # https://subtitle-bot.onrender.com
+      - key: CHANNEL_ID
+        sync: false        # @yourchannel  (optional)
+      - key: CHANNEL_LINK
+        sync: false        # https://t.me/yourchannel  (optional)
