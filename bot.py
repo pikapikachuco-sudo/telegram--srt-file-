@@ -9,7 +9,7 @@ import os, re, io, logging, threading, asyncio, time, requests
 from flask import Flask
 from groq import Groq, RateLimitError
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberStatus
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -267,11 +267,8 @@ async def is_member(bot, user_id: int) -> bool:
         return True          # Channel check বন্ধ থাকলে সবাইকে allow
     try:
         m = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        return m.status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        )
+        # status হলো string: "member", "administrator", "creator", "left", "kicked"
+        return m.status in ("member", "administrator", "creator")
     except TelegramError as e:
         log.warning(f"Channel check error: {e}")
         return True          # Error হলে block না করে allow করো
